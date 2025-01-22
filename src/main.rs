@@ -105,6 +105,80 @@ fn pwm_write(serial_port: &SerialPort, pin_number: u8, duty_cycle_percentage: u1
     serial_port.write(&write_buffer).unwrap();
 }
 
+fn board_setup(serial_port: &SerialPort) {
+    // Enable motors drivers.
+    enable_pwm_pin(serial_port, 18);
+    enable_pwm_pin(serial_port, 19);
+    enable_pwm_pin(serial_port, 20);
+    enable_pwm_pin(serial_port, 21);
+    // TODO: Enable distance sensors.
+    
+    // TODO: Configure USB stream of web cam.
+}
+
+struct MotorDriver {
+    serial_port: Arc<SerialPort>,
+}
+
+impl MotorDriver {
+    fn new(serial_port: Arc<SerialPort>) -> MotorDriver{
+        MotorDriver {
+            serial_port,
+        }
+    }
+
+    fn stop(&self) {
+        pwm_write(&self.serial_port, 19, 0);
+        pwm_write(&self.serial_port, 18, 0);
+        pwm_write(&self.serial_port, 21, 0);
+        pwm_write(&self.serial_port, 20, 0);
+    }
+
+    fn forward(&self, duty_cycle_percentage: u16) {
+        pwm_write(&self.serial_port, 19, 0);
+        pwm_write(&self.serial_port, 18, duty_cycle_percentage);
+        pwm_write(&self.serial_port, 21, 0);
+        pwm_write(&self.serial_port, 20, duty_cycle_percentage);
+    }
+    
+    fn backward(&self, duty_cycle_percentage: u16) {
+        pwm_write(&self.serial_port, 19, duty_cycle_percentage);
+        pwm_write(&self.serial_port, 18, 0);
+        pwm_write(&self.serial_port, 21, duty_cycle_percentage);
+        pwm_write(&self.serial_port, 20, 0);
+    }
+
+    fn soft_right(&self, duty_cycle_percentage: u16) {
+        pwm_write(&self.serial_port, 19, 0);
+        pwm_write(&self.serial_port, 18, duty_cycle_percentage);
+        pwm_write(&self.serial_port, 21, 0);
+        pwm_write(&self.serial_port, 20, 0);
+    }
+
+    fn hard_right(&self, duty_cycle_percentage: u16) {
+        pwm_write(&self.serial_port, 19, 0);
+        pwm_write(&self.serial_port, 18, duty_cycle_percentage);
+        pwm_write(&self.serial_port, 21, duty_cycle_percentage);
+        pwm_write(&self.serial_port, 20, 0);
+    }
+
+    fn soft_left(&self, duty_cycle_percentage: u16) {
+       
+        pwm_write(&self.serial_port, 19, 0);
+        pwm_write(&self.serial_port, 18, 0);
+        pwm_write(&self.serial_port, 21, 0);
+        pwm_write(&self.serial_port, 20, duty_cycle_percentage);
+
+    }
+
+    fn hard_left(&self, duty_cycle_percentage: u16) {
+        pwm_write(&self.serial_port, 19, duty_cycle_percentage);
+        pwm_write(&self.serial_port, 18, 0);
+        pwm_write(&self.serial_port, 21, 0);
+        pwm_write(&self.serial_port, 20, duty_cycle_percentage);
+    }
+}
+
 fn main() {
     println!("Opening serial port...start");
     let (tx, rx) = mpsc::channel();
@@ -117,42 +191,23 @@ fn main() {
         tmx_client.run();
     });
 
-    // Trigger motors.
-    enable_pwm_pin(&serial_port, 18);
-    enable_pwm_pin(&serial_port, 19);
-    enable_pwm_pin(&serial_port, 20);
-    enable_pwm_pin(&serial_port, 21);
+    // Setup board.
+    board_setup(&serial_port);
+
+    // Motor.
+    let motor_driver = MotorDriver::new(serial_port.clone());
 
     // Move forward.
-    pwm_write(&serial_port, 19, 0);
-    pwm_write(&serial_port, 18, 50);
-    pwm_write(&serial_port, 21, 0);
-    pwm_write(&serial_port, 20, 50);
-
+    motor_driver.hard_left(100);
     std::thread::sleep(std::time::Duration::from_millis(1000));
-
     // Stop.
-    pwm_write(&serial_port, 19, 0);
-    pwm_write(&serial_port, 18, 0);
-    pwm_write(&serial_port, 21, 0);
-    pwm_write(&serial_port, 20, 0);
-
+    motor_driver.stop();
     std::thread::sleep(std::time::Duration::from_millis(500));
-
     // Move backward.
-    pwm_write(&serial_port, 19, 50);
-    pwm_write(&serial_port, 18, 0);
-    pwm_write(&serial_port, 21, 50);
-    pwm_write(&serial_port, 20, 0);
-
+    motor_driver.hard_right(100);
     std::thread::sleep(std::time::Duration::from_millis(1000));
-
     // Stop.
-    pwm_write(&serial_port, 19, 0);
-    pwm_write(&serial_port, 18, 0);
-    pwm_write(&serial_port, 21, 0);
-    pwm_write(&serial_port, 20, 0);
-
+    motor_driver.stop();
     // Reset board
     reset_board(&serial_port);
 
