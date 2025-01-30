@@ -1,10 +1,22 @@
 use serial2::SerialPort;
-use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
+use std::sync::{atomic::AtomicBool, mpsc, Arc};
+use tokio::runtime::Runtime;
+
+use nokhwa::pixel_format::RgbFormat;
+use nokhwa::{
+    utils::{
+        CameraIndex,
+        RequestedFormat, RequestedFormatType,
+    }, Camera, CallbackCamera,
+};
+
+
 
 mod constants;
 
+#[derive(Debug)]
 pub struct TelemetrixData {
-    command_id: u8,
+    report_id: u8,
     length: u8,
     payload: Vec<u8>,
 }
@@ -49,29 +61,84 @@ impl TelemetrixClient {
             .shutdown_flag
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            let result = self.serial_port.read(&mut self.buffer);
-
+            let mut length  = [0; 1];
+            let result = self.serial_port.read_exact(&mut length);
             match result {
-                Ok(num_bytes) => {
-                    assert!(num_bytes >= 2);
-
-                    let message = TelemetrixData {
-                        command_id: self.buffer[0],
-                        length: self.buffer[1],
-                        payload: self.buffer[2..].to_vec(),
-                    };
-                    self.on_message.send(message).unwrap();
+                Ok(()) => {
+                    assert!(length[0] > 1);
+                    let mut report_buffer = vec![0; length[0] as usize];
+                    let result = self.serial_port.read_exact(&mut report_buffer);
+                    match result {
+                        Ok (())=> {        
+                            let message = TelemetrixData {
+                                report_id: report_buffer[0],
+                                length: report_buffer.len() as u8 - 1,
+                                payload: report_buffer[1..].to_vec(),
+                            };
+                            self.on_message.send(message).unwrap();
+                        }
+                        Err(_) => {
+                            println!("Error reading report data from serial port of length {}", length[0]);
+                        }
+                    }                    
                 }
                 Err(_) => {
                     continue;
                 }
             }
+
+            
         }
         println!("Telemetrix client dispatcher ended");
     }
 
     fn write(&self, data: &[u8]) {
         self.serial_port.write(data).unwrap();
+    }
+}
+
+struct CameraService {
+    // camera: Camera,
+    shutdown_flag: Arc<AtomicBool>,
+}
+
+impl CameraService {
+
+    fn new(shutdown_flag: Arc<AtomicBool>) -> CameraService {
+        // first camera in system
+        // let index = CameraIndex::Index(0); 
+        // request the absolute highest resolution CameraFormat that can be decoded to RGB.
+        // let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        // make the camera
+        // let camera = Camera::new(index, requested).unwrap();
+        CameraService {
+            // camera,
+            shutdown_flag,
+        }
+    }
+
+    async fn run(&mut self) {
+        let session = zenoh::open(zenoh::Config::default()).await.unwrap();
+        let index = CameraIndex::Index(0); 
+        // request the absolute highest resolution CameraFormat that can be decoded to RGB.
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        // make the camera
+        let (tx, rx) = mpsc::channel();
+        let mut camera = CallbackCamera::new(index, requested, move |buf| {
+            tx.send(buf).unwrap();
+        })
+        .unwrap();
+        camera.open_stream().unwrap();
+        let fr = camera.frame_rate().unwrap();
+        println!("Frame rate: {}", fr);
+        while !self
+            .shutdown_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let frame = rx.recv().unwrap();
+            session.put("mirte/camera", frame.buffer()).await.unwrap();
+        }
+        session.close().await.unwrap();
     }
 }
 
@@ -86,6 +153,16 @@ fn enable_pwm_pin(serial_port: &SerialPort, pin_number: u8) {
         constants::SET_PIN_MODE,
         pin_number,
         constants::AT_PWM_OUTPUT,
+    ];
+    serial_port.write(&write_buffer).unwrap();
+}
+
+fn enabe_distance_sensor(serial_port: &SerialPort, trigger_pin: u8, echo_pin: u8) {
+    let write_buffer = [
+        3,
+        constants::SONAR_NEW,
+        trigger_pin,
+        echo_pin
     ];
     serial_port.write(&write_buffer).unwrap();
 }
@@ -112,8 +189,8 @@ fn board_setup(serial_port: &SerialPort) {
     enable_pwm_pin(serial_port, 20);
     enable_pwm_pin(serial_port, 21);
     // TODO: Enable distance sensors.
-    
-    // TODO: Configure USB stream of web cam.
+    enabe_distance_sensor(serial_port, 9, 8);
+    enabe_distance_sensor(serial_port, 7, 6);
 }
 
 struct MotorDriver {
@@ -179,23 +256,33 @@ impl MotorDriver {
     }
 }
 
-fn main() {
+fn main() -> Result<(), ()> {
     println!("Opening serial port...start");
     let (tx, rx) = mpsc::channel();
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let serial_port = Arc::new(SerialPort::open("/dev/ttyUSB0", 115200).unwrap());
-    let mut tmx_client = TelemetrixClient::new(serial_port.clone(), shutdown_flag.clone(), tx);
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown_flag)).map_err(|e| println!("{e}"))?;
+    let serial_port = Arc::new(SerialPort::open("/dev/ttyUSB0", 115200).map_err(|e| println!("{e}"))?);
+    let mut tmx_client = TelemetrixClient::new(Arc::clone(&serial_port), Arc::clone(&shutdown_flag), tx);
     println!("Opening serial port...end");
 
-    let receiver = std::thread::spawn(move || {
+    let receiver_handler = std::thread::spawn(move || {
         tmx_client.run();
     });
 
     // Setup board.
     board_setup(&serial_port);
 
+    let shutdown_flag_copy = Arc::clone(&shutdown_flag);
+    let camera_service_handler = std::thread::spawn(|| {
+        let runtime = Runtime::new().unwrap();
+        let mut camera_service = CameraService::new(shutdown_flag_copy);
+        runtime.block_on(async {
+            camera_service.run().await;
+        });
+    });
+
     // Motor.
-    let motor_driver = MotorDriver::new(serial_port.clone());
+    let motor_driver = MotorDriver::new(Arc::clone(&serial_port));
 
     // Move forward.
     motor_driver.hard_left(100);
@@ -208,12 +295,40 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_millis(1000));
     // Stop.
     motor_driver.stop();
+
+    while !shutdown_flag
+            .load(std::sync::atomic::Ordering::Relaxed) {
+        let received_msg = rx.recv_timeout(std::time::Duration::from_secs(1));
+        match received_msg {
+            Ok(msg) => {
+                match msg.report_id {
+                    constants::SONAR_DISTANCE => {
+                        let distance_cm = msg.payload[1] as f32 + (msg.payload[2]) as f32 / 100.0;
+                        println!("Distance ({}): {}, {}", msg.payload[0], msg.payload[1], msg.payload[2]);
+                    }
+                    _ => {
+                        println!("Unknown report received");
+                    }
+                }
+            },
+            Err(_) => {
+                println!("No message received from Pico!!");
+                break;
+            }
+        }
+    }
+
+    println!("Reset board and close serial port...");
+
     // Reset board
     reset_board(&serial_port);
 
     // Shutdown receiver thread
     shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-    receiver.join().unwrap();
+    receiver_handler.join().unwrap();
+    camera_service_handler.join().unwrap();
 
     println!("Telemetrix client ended");
+
+    Ok(())
 }

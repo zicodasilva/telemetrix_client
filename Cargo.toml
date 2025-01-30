@@ -4,4 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+image = "0.25.5"
+nokhwa = { version = "0.10.7", features = ["input-v4l", "output-threaded"] }
 serial2 = "0.2.28"
+signal-hook = "0.3.17"
+tokio = "1.43.0"
+zenoh = "1.1.1"
