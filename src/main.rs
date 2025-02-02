@@ -98,21 +98,13 @@ impl TelemetrixClient {
 }
 
 struct CameraService {
-    // camera: Camera,
     shutdown_flag: Arc<AtomicBool>,
 }
 
 impl CameraService {
 
     fn new(shutdown_flag: Arc<AtomicBool>) -> CameraService {
-        // first camera in system
-        // let index = CameraIndex::Index(0); 
-        // request the absolute highest resolution CameraFormat that can be decoded to RGB.
-        // let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-        // make the camera
-        // let camera = Camera::new(index, requested).unwrap();
         CameraService {
-            // camera,
             shutdown_flag,
         }
     }
@@ -124,19 +116,22 @@ impl CameraService {
         let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
         // make the camera
         let (tx, rx) = mpsc::channel();
+        let mut last = std::time::Instant::now();
         let mut camera = CallbackCamera::new(index, requested, move |buf| {
+            let now = std::time::Instant::now();
+            let dt = now - last;
+            // println!("DT = {:?}; {} fps", dt, (1.0 / dt.as_secs_f64()).round());
+            last = now;
             tx.send(buf).unwrap();
         })
         .unwrap();
         camera.open_stream().unwrap();
-        let fr = camera.frame_rate().unwrap();
-        println!("Frame rate: {}", fr);
         while !self
             .shutdown_flag
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             let frame = rx.recv().unwrap();
-            session.put("mirte/camera", frame.buffer()).await.unwrap();
+            session.put("mirte/camera", frame.buffer()).encoding(zenoh::bytes::Encoding::IMAGE_JPEG).await.unwrap();
         }
         session.close().await.unwrap();
     }
@@ -303,8 +298,8 @@ fn main() -> Result<(), ()> {
             Ok(msg) => {
                 match msg.report_id {
                     constants::SONAR_DISTANCE => {
-                        let distance_cm = msg.payload[1] as f32 + (msg.payload[2]) as f32 / 100.0;
-                        println!("Distance ({}): {}, {}", msg.payload[0], msg.payload[1], msg.payload[2]);
+                        let distance_cm = 100.0 * (msg.payload[1] as f32 + (msg.payload[2]) as f32 / 100.0);
+                        println!("Distance (cm): {}", distance_cm);
                     }
                     _ => {
                         println!("Unknown report received");
