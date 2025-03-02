@@ -1,16 +1,33 @@
+use image::EncodableLayout;
 use serial2::SerialPort;
 use std::sync::{atomic::AtomicBool, mpsc, Arc};
+use std::time;
 use tokio::runtime::Runtime;
 
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::{
-    utils::{
-        CameraIndex,
-        RequestedFormat, RequestedFormatType,
-    }, Camera, CallbackCamera,
+    utils::{CameraIndex, RequestedFormat, RequestedFormatType},
+    CallbackCamera, Camera,
 };
 
+enum MotorDirectionControl {
+    Forward = 0,
+    Backward = 1,
+    Left = 2,
+    Right = 3,
+}
 
+impl From<u8> for MotorDirectionControl {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => MotorDirectionControl::Forward,
+            1 => MotorDirectionControl::Backward,
+            2 => MotorDirectionControl::Left,
+            3 => MotorDirectionControl::Right,
+            _ => panic!("Invalid motor direction control value"),
+        }
+    }
+}
 
 mod constants;
 
@@ -61,7 +78,7 @@ impl TelemetrixClient {
             .shutdown_flag
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            let mut length  = [0; 1];
+            let mut length = [0; 1];
             let result = self.serial_port.read_exact(&mut length);
             match result {
                 Ok(()) => {
@@ -69,7 +86,7 @@ impl TelemetrixClient {
                     let mut report_buffer = vec![0; length[0] as usize];
                     let result = self.serial_port.read_exact(&mut report_buffer);
                     match result {
-                        Ok (())=> {        
+                        Ok(()) => {
                             let message = TelemetrixData {
                                 report_id: report_buffer[0],
                                 length: report_buffer.len() as u8 - 1,
@@ -78,16 +95,17 @@ impl TelemetrixClient {
                             self.on_message.send(message).unwrap();
                         }
                         Err(_) => {
-                            println!("Error reading report data from serial port of length {}", length[0]);
+                            println!(
+                                "Error reading report data from serial port of length {}",
+                                length[0]
+                            );
                         }
-                    }                    
+                    }
                 }
                 Err(_) => {
                     continue;
                 }
             }
-
-            
         }
         println!("Telemetrix client dispatcher ended");
     }
@@ -98,22 +116,23 @@ impl TelemetrixClient {
 }
 
 struct CameraService {
+    z_session: zenoh::Session,
     shutdown_flag: Arc<AtomicBool>,
 }
 
 impl CameraService {
-
-    fn new(shutdown_flag: Arc<AtomicBool>) -> CameraService {
+    fn new(z_session: zenoh::Session, shutdown_flag: Arc<AtomicBool>) -> CameraService {
         CameraService {
+            z_session,
             shutdown_flag,
         }
     }
 
     async fn run(&mut self) {
-        let session = zenoh::open(zenoh::Config::default()).await.unwrap();
-        let index = CameraIndex::Index(0); 
+        let index = CameraIndex::Index(0);
         // request the absolute highest resolution CameraFormat that can be decoded to RGB.
-        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        let requested =
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
         // make the camera
         let (tx, rx) = mpsc::channel();
         let mut last = std::time::Instant::now();
@@ -131,9 +150,13 @@ impl CameraService {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             let frame = rx.recv().unwrap();
-            session.put("mirte/camera", frame.buffer()).encoding(zenoh::bytes::Encoding::IMAGE_JPEG).await.unwrap();
+            self.z_session
+                .put("mirte/camera", frame.buffer())
+                .encoding(zenoh::bytes::Encoding::IMAGE_JPEG)
+                .await
+                .unwrap();
         }
-        session.close().await.unwrap();
+        self.z_session.close().await.unwrap();
     }
 }
 
@@ -153,12 +176,7 @@ fn enable_pwm_pin(serial_port: &SerialPort, pin_number: u8) {
 }
 
 fn enabe_distance_sensor(serial_port: &SerialPort, trigger_pin: u8, echo_pin: u8) {
-    let write_buffer = [
-        3,
-        constants::SONAR_NEW,
-        trigger_pin,
-        echo_pin
-    ];
+    let write_buffer = [3, constants::SONAR_NEW, trigger_pin, echo_pin];
     serial_port.write(&write_buffer).unwrap();
 }
 
@@ -193,10 +211,8 @@ struct MotorDriver {
 }
 
 impl MotorDriver {
-    fn new(serial_port: Arc<SerialPort>) -> MotorDriver{
-        MotorDriver {
-            serial_port,
-        }
+    fn new(serial_port: Arc<SerialPort>) -> MotorDriver {
+        MotorDriver { serial_port }
     }
 
     fn stop(&self) {
@@ -212,7 +228,7 @@ impl MotorDriver {
         pwm_write(&self.serial_port, 21, 0);
         pwm_write(&self.serial_port, 20, duty_cycle_percentage);
     }
-    
+
     fn backward(&self, duty_cycle_percentage: u16) {
         pwm_write(&self.serial_port, 19, duty_cycle_percentage);
         pwm_write(&self.serial_port, 18, 0);
@@ -235,12 +251,10 @@ impl MotorDriver {
     }
 
     fn soft_left(&self, duty_cycle_percentage: u16) {
-       
         pwm_write(&self.serial_port, 19, 0);
         pwm_write(&self.serial_port, 18, 0);
         pwm_write(&self.serial_port, 21, 0);
         pwm_write(&self.serial_port, 20, duty_cycle_percentage);
-
     }
 
     fn hard_left(&self, duty_cycle_percentage: u16) {
@@ -251,13 +265,17 @@ impl MotorDriver {
     }
 }
 
-fn main() -> Result<(), ()> {
+#[tokio::main]
+async fn main() -> Result<(), ()> {
     println!("Opening serial port...start");
     let (tx, rx) = mpsc::channel();
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown_flag)).map_err(|e| println!("{e}"))?;
-    let serial_port = Arc::new(SerialPort::open("/dev/ttyUSB0", 115200).map_err(|e| println!("{e}"))?);
-    let mut tmx_client = TelemetrixClient::new(Arc::clone(&serial_port), Arc::clone(&shutdown_flag), tx);
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown_flag))
+        .map_err(|e| println!("{e}"))?;
+    let serial_port =
+        Arc::new(SerialPort::open("/dev/ttyUSB0", 115200).map_err(|e| println!("{e}"))?);
+    let mut tmx_client =
+        TelemetrixClient::new(Arc::clone(&serial_port), Arc::clone(&shutdown_flag), tx);
     println!("Opening serial port...end");
 
     let receiver_handler = std::thread::spawn(move || {
@@ -267,10 +285,14 @@ fn main() -> Result<(), ()> {
     // Setup board.
     board_setup(&serial_port);
 
+    // Zenoh session.
+    let z_session = zenoh::open(zenoh::Config::default()).await.unwrap();
+
     let shutdown_flag_copy = Arc::clone(&shutdown_flag);
+    let z_session_copy = z_session.clone();
     let camera_service_handler = std::thread::spawn(|| {
         let runtime = Runtime::new().unwrap();
-        let mut camera_service = CameraService::new(shutdown_flag_copy);
+        let mut camera_service = CameraService::new(z_session_copy, shutdown_flag_copy);
         runtime.block_on(async {
             camera_service.run().await;
         });
@@ -278,32 +300,54 @@ fn main() -> Result<(), ()> {
 
     // Motor.
     let motor_driver = MotorDriver::new(Arc::clone(&serial_port));
+    let teleop_subscriber = z_session
+        .declare_subscriber("mirte/motor/control")
+        .await
+        .unwrap();
+    let shutdown_flag_copy = Arc::clone(&shutdown_flag);
+    let motor_control_service_handler = tokio::spawn(async move {
+        while let Ok(value) = teleop_subscriber.recv() {
+            let bytes = value.payload().to_bytes();
+            match MotorDirectionControl::from(bytes[0]) {
+                MotorDirectionControl::Forward => {
+                    motor_driver.forward(50);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    motor_driver.stop();
+                }
+                MotorDirectionControl::Backward => {
+                    motor_driver.backward(50);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    motor_driver.stop();
+                }
+                MotorDirectionControl::Left => {
+                    motor_driver.soft_left(100);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    motor_driver.stop();
+                }
+                MotorDirectionControl::Right => {
+                    motor_driver.soft_right(100);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    motor_driver.stop();
+                }
+                _ => motor_driver.stop(),
+            }
+            if shutdown_flag_copy.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+        }
+    });
 
-    // Move forward.
-    motor_driver.hard_left(100);
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-    // Stop.
-    motor_driver.stop();
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    // Move backward.
-    motor_driver.hard_right(100);
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-    // Stop.
-    motor_driver.stop();
-
-    while !shutdown_flag
-            .load(std::sync::atomic::Ordering::Relaxed) {
+    while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
         let received_msg = rx.recv_timeout(std::time::Duration::from_secs(1));
         match received_msg {
-            Ok(msg) => {
-                match msg.report_id {
-                    constants::SONAR_DISTANCE => {
-                        let distance_cm = 100.0 * (msg.payload[1] as f32 + (msg.payload[2]) as f32 / 100.0);
-                        println!("Distance (cm): {}", distance_cm);
-                    }
-                    _ => {
-                        println!("Unknown report received");
-                    }
+            Ok(msg) => match msg.report_id {
+                constants::SONAR_DISTANCE => {
+                    let distance_cm =
+                        100.0 * (msg.payload[1] as f32 + (msg.payload[2]) as f32 / 100.0);
+                    println!("Distance (cm): {}", distance_cm);
+                }
+                _ => {
+                    println!("Unknown report received");
                 }
             },
             Err(_) => {
@@ -320,6 +364,7 @@ fn main() -> Result<(), ()> {
 
     // Shutdown receiver thread
     shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    motor_control_service_handler.await.unwrap();
     receiver_handler.join().unwrap();
     camera_service_handler.join().unwrap();
 
